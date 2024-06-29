@@ -3,6 +3,7 @@
 #include "qvwin32functions.h"
 #include "qvcocoafunctions.h"
 #include "qvlinuxx11functions.h"
+#include <cstring>
 #include <random>
 #include <QMessageBox>
 #include <QDir>
@@ -115,14 +116,14 @@ void QVImageCore::loadFile(const QString &fileName, bool isReloading)
     else
     {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-        loadFutureWatcher.setFuture(QtConcurrent::run(this, &QVImageCore::readFile, sanitaryFileName, targetColorSpace, false));
+        loadFutureWatcher.setFuture(QtConcurrent::run(this, &QVImageCore::readFile, sanitaryFileName, targetColorSpace));
 #else
-        loadFutureWatcher.setFuture(QtConcurrent::run(&QVImageCore::readFile, this, sanitaryFileName, targetColorSpace, false));
+        loadFutureWatcher.setFuture(QtConcurrent::run(&QVImageCore::readFile, this, sanitaryFileName, targetColorSpace));
 #endif
     }
 }
 
-QVImageCore::ReadData QVImageCore::readFile(const QString &fileName, const QColorSpace &targetColorSpace, bool forCache)
+QVImageCore::ReadData QVImageCore::readFile(const QString &fileName, const QColorSpace &targetColorSpace)
 {
     QImageReader imageReader;
     imageReader.setDecideFormatFromContent(true);
@@ -146,6 +147,16 @@ QVImageCore::ReadData QVImageCore::readFile(const QString &fileName, const QColo
         readImage = imageReader.read();
     }
 
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0) && QT_VERSION < QT_VERSION_CHECK(6, 7, 2)
+    // Work around Qt ICC profile parsing bug
+    if (!readImage.colorSpace().isValid() && !readImage.colorSpace().iccProfile().isEmpty())
+    {
+        QByteArray profileData = readImage.colorSpace().iccProfile();
+        if (removeTinyDataTagsFromIccProfile(profileData))
+            readImage.setColorSpace(QColorSpace::fromIccProfile(profileData));
+    }
+#endif
+
 #if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
     // Assume image is sRGB if it doesn't specify
     if (!readImage.colorSpace().isValid())
@@ -164,12 +175,17 @@ QVImageCore::ReadData QVImageCore::readFile(const QString &fileName, const QColo
         fileInfo.absoluteFilePath(),
         fileInfo.size(),
         imageReader.size(),
-        targetColorSpace
+        targetColorSpace,
+        {}
     };
-    // Only error out when not loading for cache
-    if (readPixmap.isNull() && !forCache)
+
+    if (readPixmap.isNull())
     {
-        emit readError(imageReader.error(), imageReader.errorString(), fileInfo.fileName());
+        readData.errorData = {
+            true,
+            imageReader.error(),
+            imageReader.errorString()
+        };
     }
 
     return readData;
@@ -177,6 +193,16 @@ QVImageCore::ReadData QVImageCore::readFile(const QString &fileName, const QColo
 
 void QVImageCore::loadPixmap(const ReadData &readData)
 {
+    if (readData.errorData.hasError)
+    {
+        currentFileDetails = getEmptyFileDetails();
+        currentFileDetails.errorData = readData.errorData;
+    }
+    else
+    {
+        currentFileDetails.errorData = {};
+    }
+
     // Do this first so we can keep folder info even when loading errored files
     currentFileDetails.fileInfo = QFileInfo(readData.absoluteFilePath);
     currentFileDetails.updateLoadedIndexInFolder();
@@ -186,8 +212,11 @@ void QVImageCore::loadPixmap(const ReadData &readData)
     // Reset mechanism to avoid stalling while loading
     waitingOnLoad = false;
 
-    if (readData.pixmap.isNull())
+    if (currentFileDetails.errorData.hasError)
+    {
+        loadEmptyPixmap();
         return;
+    }
 
     loadedPixmap = matchCurrentRotation(readData.pixmap);
 
@@ -233,10 +262,22 @@ void QVImageCore::loadPixmap(const ReadData &readData)
 
 void QVImageCore::closeImage()
 {
+    currentFileDetails = getEmptyFileDetails();
+    loadEmptyPixmap();
+}
+
+void QVImageCore::loadEmptyPixmap()
+{
     loadedPixmap = QPixmap();
     loadedMovie.stop();
     loadedMovie.setFileName("");
-    currentFileDetails = {
+
+    emit fileChanged();
+}
+
+QVImageCore::FileDetails QVImageCore::getEmptyFileDetails()
+{
+    return {
         QFileInfo(),
         currentFileDetails.folderFileInfoList,
         currentFileDetails.loadedIndexInFolder,
@@ -245,10 +286,9 @@ void QVImageCore::closeImage()
         false,
         QSize(),
         QSize(),
-        QElapsedTimer()
+        QElapsedTimer(),
+        {}
     };
-
-    emit fileChanged();
 }
 
 // All file logic, sorting, etc should be moved to a different class or file
@@ -479,9 +519,9 @@ void QVImageCore::requestCachingFile(const QString &filePath, const QColorSpace 
     });
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    cacheFutureWatcher->setFuture(QtConcurrent::run(this, &QVImageCore::readFile, filePath, targetColorSpace, true));
+    cacheFutureWatcher->setFuture(QtConcurrent::run(this, &QVImageCore::readFile, filePath, targetColorSpace));
 #else
-    cacheFutureWatcher->setFuture(QtConcurrent::run(&QVImageCore::readFile, this, filePath, targetColorSpace, true));
+    cacheFutureWatcher->setFuture(QtConcurrent::run(&QVImageCore::readFile, this, filePath, targetColorSpace));
 #endif
 }
 
@@ -536,11 +576,64 @@ QColorSpace QVImageCore::detectDisplayColorSpace() const
 #endif
 
     if (!profileData.isEmpty())
-        return QColorSpace::fromIccProfile(profileData);
+    {
+        QColorSpace colorSpace = QColorSpace::fromIccProfile(profileData);
+#if QT_VERSION < QT_VERSION_CHECK(6, 7, 2)
+        if (!colorSpace.isValid() && removeTinyDataTagsFromIccProfile(profileData))
+            colorSpace = QColorSpace::fromIccProfile(profileData);
+#endif
+        return colorSpace;
+    }
 #endif
 
     return {};
 }
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0) && QT_VERSION < QT_VERSION_CHECK(6, 7, 2)
+// Workaround for QTBUG-125241
+bool QVImageCore::removeTinyDataTagsFromIccProfile(QByteArray &profile)
+{
+    const int offsetTagCount = 128;
+    const qsizetype length = profile.length();
+    qsizetype offset = offsetTagCount;
+    char *data = profile.data();
+    bool foundTinyData = false;
+    // read tag count
+    if (length - offset < 4)
+        return false;
+    quint32 tagCount = qFromBigEndian<quint32>(data + offset);
+    offset += 4;
+    // so we don't have to worry about overflows
+    if (tagCount > 99999)
+        return false;
+    // loop through tags
+    if (length - offset < qsizetype(tagCount * 12))
+        return false;
+    while (tagCount)
+    {
+        tagCount -= 1;
+        const quint32 dataSize = qFromBigEndian<quint32>(data + offset + 8);
+        if (dataSize >= 12)
+        {
+            // this tag is fine
+            offset += 12;
+            continue;
+        }
+        // qt will fail on this tag, remove it
+        foundTinyData = true;
+        if (tagCount)
+        {
+            // shift subsequent tags back
+            std::memmove(data + offset, data + offset + 12, tagCount * 12);
+        }
+        // zero fill gap at end
+        std::memset(data + offset + (tagCount * 12), 0, 12);
+        // decrement tag count
+        qToBigEndian(qFromBigEndian<quint32>(data + offsetTagCount) - 1, data + offsetTagCount);
+    }
+    return foundTinyData;
+}
+#endif
 
 void QVImageCore::jumpToNextFrame()
 {
